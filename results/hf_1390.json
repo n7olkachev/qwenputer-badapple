@@ -1,0 +1,10 @@
+{
+ "start_frame": 1390,
+ "tokens": 6000,
+ "inexact_dims": 0,
+ "wrong_predictions": 0,
+ "mode": "prefill",
+ "device": "cpu",
+ "dtype": "bf16",
+ "seconds": 274.91136384010315
+}

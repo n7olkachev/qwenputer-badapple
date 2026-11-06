@@ -1,0 +1,10 @@
+{
+ "start_frame": 0,
+ "tokens": 28000,
+ "bytes": 7716,
+ "frames": 12.86,
+ "tokens_match_reference": true,
+ "bytes_match_video": true,
+ "device": "cpu",
+ "seconds": 156.44965243339539
+}

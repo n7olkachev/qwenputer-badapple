@@ -1,0 +1,177 @@
+"""The hero clip: part A shows frames scanning in byte by byte at the machine's real speed
+(REAL_TPS trace tokens per second, as on one L4), part B plays on at 12 fps ("sped up"), with the
+song. 1280x720, 60 fps.
+
+usage: uv run --project qwenputer/experimental/riscv python tools/render_hero.py
+           [--start 52] [--real-frames 4] [--end 88] [--out build/hero.mp4]
+"""
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT / "qwenputer/experimental/riscv"))
+from chipformer.rv import spec as S  # noqa: E402
+
+W, H, FPS, FB = 80, 60, 12, 600
+CW, CH, OUT_FPS = 1280, 720, 60
+REAL_TPS = 4000
+SCALE = 8
+FRAME_X, FRAME_Y = 40, 150
+PANE_X, PANE_Y, PANE_W, LINES, LINE_H = 730, 150, 510, 21, 22
+FONT = "/System/Library/Fonts/Menlo.ttc"
+BG, FG, DIM, HI = (12, 12, 14), (230, 230, 230), (120, 120, 130), (120, 220, 140)
+PIX_ON, PIX_OFF, SCAN = (240, 240, 240), (50, 50, 56), (120, 220, 140)
+
+
+def fam_ranges():
+    out = {nm: (b, b + s) for nm, (b, s) in S.FAMILIES.items()}
+    out.update({nm: (t, t + 1) for nm, t in S.CONTROLS.items()})
+    return out
+
+
+class Renderer:
+    def __init__(self, out, trace):
+        self.out, self.trace = out, trace
+        fr = fam_ranges()
+        self.b0 = fr["BYTE"][0]
+        self.byte_pos = np.nonzero((trace >= self.b0) & (trace < self.b0 + 256))[0]
+        final = np.zeros(len(trace), dtype=bool)
+        for nm in S.FINAL - {"R"}:
+            lo, hi = fr[nm]
+            final |= (trace >= lo) & (trace < hi)
+        self.instr_cum = np.cumsum(final)
+        self.font = ImageFont.truetype(FONT, 17)
+        self.small = ImageFont.truetype(FONT, 14)
+        self.big = ImageFont.truetype(FONT, 26)
+        self.badge_f = ImageFont.truetype(FONT, 15)
+        self.n_frames = len(out) // FB
+
+    def frame_pixels(self, f):
+        return np.unpackbits(np.frombuffer(self.out[f * FB:(f + 1) * FB], np.uint8)).reshape(H, W)
+
+    def draw(self, pixels, tok_end, badge, badge_color, scan_row=None, frame_no=None, ghosts=(),
+             rate=None):
+        """ghosts: [(tok_end, alpha, dy)] drawn under the main token list (motion blur)."""
+        im = Image.new("RGB", (CW, CH), BG)
+        d = ImageDraw.Draw(im)
+        d.text((40, 34), "Bad Apple!! inside Qwen3.5-4B", font=self.big, fill=FG)
+        d.text((40, 74), "a RISC-V CPU compiled as 11 extra transformer layers ahead of Qwen's 32 decodes the video;", font=self.small, fill=DIM)
+        d.text((40, 94), "the model's output tokens are on the right. every BYTE token is 8 pixels.", font=self.small, fill=DIM)
+        fim = Image.fromarray((pixels * 255).astype(np.uint8), "L").resize((W * SCALE, H * SCALE), Image.NEAREST)
+        im.paste(fim, (FRAME_X, FRAME_Y))
+        if scan_row is not None:
+            y = FRAME_Y + scan_row * SCALE
+            d.rectangle([FRAME_X, y, FRAME_X + W * SCALE - 1, y + 1], fill=SCAN)
+        d.rectangle([FRAME_X - 1, FRAME_Y - 1, FRAME_X + W * SCALE, FRAME_Y + H * SCALE], outline=(60, 60, 66))
+        # badge
+        tw = d.textlength(badge, font=self.badge_f)
+        d.rectangle([FRAME_X, FRAME_Y - 30, FRAME_X + tw + 16, FRAME_Y - 8], fill=badge_color)
+        d.text((FRAME_X + 8, FRAME_Y - 27), badge, font=self.badge_f, fill=(10, 10, 12))
+        # tokens
+        hdr = "model output (trace tokens)" + (f"   {rate:,.0f} tokens/s" if rate else "")
+        d.text((PANE_X, PANE_Y - 28), hdr, font=self.small, fill=DIM)
+        mix = lambda c, a: tuple(int(BG[i] + (c[i] - BG[i]) * a) for i in range(3))
+        for g_end, alpha, dy in list(ghosts) + [(tok_end, 1.0, 0)]:
+            toks = self.trace[max(0, g_end - LINES + 1):g_end + 1]
+            y = PANE_Y + dy
+            for t in toks:
+                t = int(t)
+                if self.b0 <= t < self.b0 + 256:
+                    v = t - self.b0
+                    d.text((PANE_X, y), f"BYTE {v:02x}", font=self.font, fill=mix(HI, alpha))
+                    for i in range(8):
+                        x = PANE_X + 120 + i * 18
+                        d.rectangle([x, y + 3, x + 14, y + 17],
+                                    fill=mix(PIX_ON if v >> (7 - i) & 1 else PIX_OFF, alpha))
+                else:
+                    d.text((PANE_X, y), S.name(t), font=self.font, fill=mix(DIM, alpha))
+                y += LINE_H
+        d.rectangle([PANE_X - 12, PANE_Y - 10, PANE_X + PANE_W, PANE_Y + LINES * LINE_H], outline=(60, 60, 66))
+        # stats
+        d.text((40, 648), f"frame {frame_no:4d} / {self.n_frames}   {tok_end + 1:,} tokens   "
+                          f"{int(self.instr_cum[tok_end]):,} instructions", font=self.font, fill=FG)
+        d.text((40, 674), "video: 250 KB ZX0 in the DROM + ROM (as lui immediates)   RAM: a 26 KB ring in DeltaNet state   "
+                          "", font=self.small, fill=DIM)
+        d.text((40, 694), "19.06M tokens; 86K generated by the compiled layers so far, 0 mismatches   "
+                          "audio: the original song, dubbed; the machine outputs pixels only", font=self.small, fill=DIM)
+        return im.tobytes()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", type=float, default=52.0, help="seconds into the video")
+    ap.add_argument("--real-frames", type=int, default=4, help="frames scanned in at real speed")
+    ap.add_argument("--end", type=float, default=88.0)
+    ap.add_argument("--out", default=str(ROOT / "build/hero.mp4"))
+    ap.add_argument("--audio", default=str(ROOT / "video/badapple.mp4"))
+    a = ap.parse_args()
+
+    out = (ROOT / "build/out.bin").read_bytes()
+    trace = np.fromfile(ROOT / "build/trace.u32", dtype=np.uint32)
+    r = Renderer(out, trace)
+    bp = r.byte_pos
+    f_a = int(a.start * FPS)
+    f_b = f_a + a.real_frames
+    f_end = int(a.end * FPS)
+
+    # part A: tokens from after frame f_a-1's last byte to frame f_b-1's last byte
+    t_start = int(bp[f_a * FB - 1]) + 1 if f_a > 0 else 1
+    t_stop = int(bp[f_b * FB - 1])
+    n_out_a = int(np.ceil((t_stop - t_start + 1) / REAL_TPS * OUT_FPS))
+    # part B
+    t_b0, t_b1 = int(bp[f_b * FB - 1]) + 1, int(bp[f_end * FB - 1])
+    speedup = (t_b1 - t_b0) / ((f_end - f_b) / FPS) / REAL_TPS
+    dur_a = n_out_a / OUT_FPS
+    print(f"part A: frames {f_a}..{f_b - 1}, {t_stop - t_start + 1} tokens, {dur_a:.1f}s; "
+          f"part B: frames {f_b}..{f_end - 1}, {(f_end - f_b) / FPS:.1f}s, sped up {speedup:.0f}x")
+
+    # the audio first: the song from part B's first frame, delayed by part A's length
+    wav = str(ROOT / "build/hero_audio.wav")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{f_b / FPS:.3f}", "-t", f"{(f_end - f_b) / FPS:.3f}",
+                    "-i", a.audio, "-af", f"adelay={int(dur_a * 1000)}:all=1", wav], check=True)
+    cmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CW}x{CH}",
+           "-r", str(OUT_FPS), "-i", "-", "-i", wav, "-map", "0:v", "-map", "1:a",
+           "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "160k", "-shortest", a.out]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    badge_a = f"AT L4 SPEED: ~{REAL_TPS:,} tokens/s (author's benchmark), ~2 s per frame"
+    prev = r.frame_pixels(f_a - 1)
+    for k in range(n_out_a):
+        t = min(t_start + int(k * REAL_TPS / OUT_FPS), t_stop)
+        nbytes = int(np.searchsorted(bp, t, side="right"))  # bytes printed up to token t
+        f = nbytes // FB
+        part = nbytes % FB
+        cur = r.frame_pixels(min(f, r.n_frames - 1))
+        prevf = r.frame_pixels(f - 1) if f > f_a else np.zeros((H, W), np.uint8)
+        rows_done = part // (W // 8)
+        pix = prevf.copy()
+        pix[:rows_done] = cur[:rows_done]
+        # the partial row
+        if part % (W // 8):
+            cols = (part % (W // 8)) * 8
+            pix[rows_done, :cols] = cur[rows_done, :cols]
+        p.stdin.write(r.draw(pix, t, badge_a, (120, 220, 140), scan_row=min(rows_done, H - 1), frame_no=f + 1, rate=REAL_TPS))
+    badge_b = f"SPED UP {speedup:.0f}x"
+    sub = OUT_FPS // FPS
+    for f in range(f_b, f_end):
+        pix = r.frame_pixels(f)
+        t0 = int(bp[f * FB - 1]) + 1
+        t1 = int(bp[(f + 1) * FB - 1])
+        step = (t1 - t0) / sub
+        for j in range(sub):
+            t = int(t0 + step * (j + 1)) if j < sub - 1 else t1
+            ghosts = [(max(t0, int(t - step * 2 / 3)), 0.22, -9), (max(t0, int(t - step / 3)), 0.45, -5)]
+            p.stdin.write(r.draw(pix, t, badge_b, (230, 180, 80), frame_no=f + 1, ghosts=ghosts,
+                                 rate=REAL_TPS * speedup))
+    p.stdin.close()
+    p.wait()
+    print("wrote", a.out)
+
+
+if __name__ == "__main__":
+    main()

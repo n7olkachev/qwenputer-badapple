@@ -1,0 +1,12 @@
+# generated: frames, compressed video, ELF, traces, renders
+build/
+# the source video/audio (fetched with yt-dlp, see README)
+video/
+# upstream clones (see README)
+qwenputer/
+third_party/
+# drafts
+social/
+__pycache__/
+.venv/
+.DS_Store
